@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Braille nerd snipe</title>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; background: #1a1a1a; color: #fff; padding: 20px; text-align: center; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .controls { 
+            margin: 20px auto; 
+            display: grid; 
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); 
+            gap: 15px; 
+            background: #2d2d2d; 
+            padding: 20px; 
+            border-radius: 8px;
+            text-align: left;
+        }
+        canvas { max-width: 100%; border: 1px solid #444; margin-top: 20px; cursor: crosshair; }
+        label { display: block; font-size: 0.9em; color: #aaa; margin-bottom: 5px; }
+        input[type="range"] { width: 100%; accent-color: #00d2d3; }
+        .status { margin-bottom: 10px; font-weight: bold; color: #00d2d3; }
+        .checkbox-group { display: flex; align-items: center; gap: 10px; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>Braille nerd snipe</h2>
+    <div id="status" class="status">Loading OpenCV...</div>
+    
+    <input type="file" id="fileInput" accept="image/*" disabled>
+
+    <div class="controls">
+        <div>
+            <label>Morph Kernel Size (Match Dot Size)</label>
+            <input type="range" id="kernelSize" min="3" max="25" step="2" value="13">
+            <span id="val_kernel" style="font-size:0.8em">13px</span>
+        </div>
+        <div>
+            <label>Circularity Strictness</label>
+            <input type="range" id="circularity" min="0.1" max="1.0" step="0.05" value="0.5">
+        </div>
+        <div>
+            <label>Threshold Strength</label>
+            <input type="range" id="threshold" min="10" max="255" value="40">
+        </div>
+        <div class="checkbox-group">
+            <input type="checkbox" id="invertCheck">
+            <label for="invertCheck">Invert</label>
+        </div>
+        <div>
+            <label>Cluster X (Horizontal)</label>
+            <input type="range" id="clusterX" min="0.5" max="3.0" step="0.1" value="1.1">
+            <span id="val_clusterX" style="font-size:0.8em">1.1x</span>
+        </div>
+        <div>
+            <label>Cluster Y (Vertical)</label>
+            <input type="range" id="clusterY" min="0.5" max="4.0" step="0.1" value="2.3">
+            <span id="val_clusterY" style="font-size:0.8em">2.3x</span>
+        </div>
+        <div>
+            <button id="resetDots" style="padding: 8px 16px; background: #444; color: #fff; border: none; border-radius: 4px; cursor: pointer;">Reset Manual Edits</button>
+            <div style="font-size: 0.8em; color: #888; margin-top: 5px;">Click image to add/remove dots</div>
+        </div>
+    </div>
+
+    <canvas id="canvasOutput"></canvas>
+
+    <div id="decodedOutput" style="margin-top: 20px; padding: 20px; background: #2d2d2d; border-radius: 8px; text-align: left;">
+        <label style="color: #aaa;">Decoded Text:</label>
+        <div id="decodedText" style="font-size: 1.5em; margin-top: 10px; font-family: monospace; color: #00d2d3; min-height: 1.5em; white-space: pre-wrap;"></div>
+        <div id="debugInfo" style="font-size: 0.8em; margin-top: 10px; font-family: monospace; color: #888;"></div>
+    </div>
+</div>
+
+<script async src="https://docs.opencv.org/4.8.0/opencv.js" onload="onOpenCvReady();"></script>
+
+<script>
+    // Braille lookup: pattern (6-bit) -> character
+    // Dots numbered: 1 4
+    //                2 5
+    //                3 6
+    // Bit positions: dot1=bit0, dot2=bit1, dot3=bit2, dot4=bit3, dot5=bit4, dot6=bit5
+    const brailleToChar = {
+        0b000001: 'a', 0b000011: 'b', 0b001001: 'c', 0b011001: 'd', 0b010001: 'e',
+        0b001011: 'f', 0b011011: 'g', 0b010011: 'h', 0b001010: 'i', 0b011010: 'j',
+        0b000101: 'k', 0b000111: 'l', 0b001101: 'm', 0b011101: 'n', 0b010101: 'o',
+        0b001111: 'p', 0b011111: 'q', 0b010111: 'r', 0b001110: 's', 0b011110: 't',
+        0b100101: 'u', 0b100111: 'v', 0b111010: 'w', 0b101101: 'x', 0b111101: 'y',
+        0b110101: 'z',
+        // Numbers (preceded by number sign in real braille)
+        // Using same patterns as a-j for 1-0
+        // Punctuation
+        0b000010: ',', 0b000110: ';', 0b010010: ':', 0b010110: '.',
+        0b010000: "'", 0b011000: '-', 0b000100: "'",
+        // Special
+        0b000000: ' ', // empty cell (shouldn't normally occur)
+    };
+
+    function decodeBraille(validDots, medianDist, maxX, maxY, dst) {
+        if (validDots.length < 1) return { text: '', debug: 'No dots' };
+
+        // Build adjacency graph and find connected components
+        const n = validDots.length;
+        const adj = Array.from({length: n}, () => []);
+
+        for (let i = 0; i < n; i++) {
+            for (let j = i + 1; j < n; j++) {
+                const dx = Math.abs(validDots[i].x - validDots[j].x);
+                const dy = Math.abs(validDots[i].y - validDots[j].y);
+                if (dx < maxX && dy < maxY) {
+                    adj[i].push(j);
+                    adj[j].push(i);
+                }
+            }
+        }
+
+        // Find connected components (each = one character)
+        const visited = new Array(n).fill(false);
+        const characters = [];
+
+        for (let i = 0; i < n; i++) {
+            if (visited[i]) continue;
+            const cluster = [];
+            const queue = [i];
+            visited[i] = true;
+            while (queue.length > 0) {
+                const curr = queue.shift();
+                cluster.push({ ...validDots[curr], idx: curr });
+                for (const neighbor of adj[curr]) {
+                    if (!visited[neighbor]) {
+                        visited[neighbor] = true;
+                        queue.push(neighbor);
+                    }
+                }
+            }
+            characters.push(cluster);
+        }
+
+        // Cluster colors for visualization
+        const clusterColors = [
+            [255, 100, 100], [100, 255, 100], [100, 100, 255],
+            [255, 255, 100], [255, 100, 255], [100, 255, 255],
+            [255, 180, 100], [180, 100, 255], [100, 255, 180],
+            [255, 150, 150], [150, 255, 150], [150, 150, 255]
+        ];
+
+        // Draw cluster assignments
+        for (let i = 0; i < characters.length; i++) {
+            const color = clusterColors[i % clusterColors.length];
+            for (const dot of characters[i]) {
+                cv.circle(dst, new cv.Point(dot.x, dot.y), 8,
+                    new cv.Scalar(color[0], color[1], color[2], 255), 2);
+            }
+        }
+
+        // Decode each character using local grid
+        const decodedChars = [];
+
+        for (let i = 0; i < characters.length; i++) {
+            const cluster = characters[i];
+            const xs = cluster.map(d => d.x);
+            const ys = cluster.map(d => d.y);
+            const minX = Math.min(...xs);
+            const maxXc = Math.max(...xs);
+            const minY = Math.min(...ys);
+            const maxYc = Math.max(...ys);
+
+            // Expected grid positions based on cluster's top-left corner
+            // Rows: top of cluster + 0, 1, 2 times medianDist
+            // Cols: left of cluster + 0, 1 times medianDist
+            const expectedRows = [minY, minY + medianDist, minY + 2 * medianDist];
+            const expectedCols = [minX, minX + medianDist];
+
+            // Draw expected grid for this cluster (faint lines)
+            const gridColor = new cv.Scalar(80, 80, 80, 255);
+            for (let r = 0; r < 3; r++) {
+                const y = Math.round(expectedRows[r]);
+                cv.line(dst, new cv.Point(minX - 5, y), new cv.Point(minX + medianDist + 5, y), gridColor, 1);
+            }
+            for (let c = 0; c < 2; c++) {
+                const x = Math.round(expectedCols[c]);
+                cv.line(dst, new cv.Point(x, minY - 5), new cv.Point(x, minY + 2 * medianDist + 5), gridColor, 1);
+            }
+
+            // Build 6-bit pattern
+            let pattern = 0;
+            let dotInfo = [];
+
+            for (const dot of cluster) {
+                // Find closest expected row (0, 1, or 2)
+                let row = 0;
+                let minRowDist = Infinity;
+                for (let r = 0; r < 3; r++) {
+                    const dist = Math.abs(dot.y - expectedRows[r]);
+                    if (dist < minRowDist) {
+                        minRowDist = dist;
+                        row = r;
+                    }
+                }
+
+                // Find closest expected column (0 or 1)
+                let col = 0;
+                const distCol0 = Math.abs(dot.x - expectedCols[0]);
+                const distCol1 = Math.abs(dot.x - expectedCols[1]);
+                if (distCol1 < distCol0) {
+                    col = 1;
+                }
+
+                // Braille bit position: col 0 = bits 0,1,2; col 1 = bits 3,4,5
+                const bitPos = row + col * 3;
+                pattern |= (1 << bitPos);
+                dotInfo.push({ row, col, bitPos });
+
+                // Draw dot position label (small text showing row,col)
+                cv.putText(dst, `${row},${col}`, new cv.Point(dot.x + 10, dot.y + 4),
+                    cv.FONT_HERSHEY_SIMPLEX, 0.3, new cv.Scalar(255, 255, 0, 255), 1);
+            }
+
+            // Compute centroid Y for text line grouping
+            const centroidY = ys.reduce((a, b) => a + b, 0) / ys.length;
+
+            const char = brailleToChar[pattern];
+            decodedChars.push({
+                x: minX,
+                y: minY,
+                centroidY,
+                pattern,
+                char: char !== undefined ? char : '?',
+                dots: cluster.length,
+                dotInfo
+            });
+
+            // Draw decoded character label above the cluster
+            const patternStr = pattern.toString(2).padStart(6, '0');
+            cv.putText(dst, `${char || '?'}`, new cv.Point(minX, minY - 25),
+                cv.FONT_HERSHEY_SIMPLEX, 0.6, new cv.Scalar(255, 255, 255, 255), 2);
+            cv.putText(dst, patternStr, new cv.Point(minX, minY - 8),
+                cv.FONT_HERSHEY_SIMPLEX, 0.35, new cv.Scalar(200, 200, 200, 255), 1);
+        }
+
+        // Phase 3: Group characters into text lines by centroid Y
+        // Sort by centroid Y first
+        decodedChars.sort((a, b) => a.centroidY - b.centroidY);
+
+        // Group into lines: characters with centroid Y within ~3*medianDist are same line
+        // (a braille cell is 3 rows tall, so chars on same line should be within this range)
+        const lineThreshold = medianDist * 3;
+        const nonEmptyLines = [];
+        let currentLine = [decodedChars[0]];
+
+        for (let i = 1; i < decodedChars.length; i++) {
+            // Compare to the median centroidY of current line for stability
+            const lineMedianY = currentLine.map(c => c.centroidY).sort((a,b) => a-b)[Math.floor(currentLine.length/2)];
+            const yDiff = Math.abs(decodedChars[i].centroidY - lineMedianY);
+
+            if (yDiff < lineThreshold) {
+                currentLine.push(decodedChars[i]);
+            } else {
+                nonEmptyLines.push(currentLine);
+                currentLine = [decodedChars[i]];
+            }
+        }
+        nonEmptyLines.push(currentLine);
+
+        // Sort each line by X position
+        for (const line of nonEmptyLines) {
+            line.sort((a, b) => a.x - b.x);
+        }
+
+        // Detect word spaces and build output
+        let result = '';
+
+        for (let lineIdx = 0; lineIdx < nonEmptyLines.length; lineIdx++) {
+            const line = nonEmptyLines[lineIdx];
+
+            // Calculate median gap for this line
+            const lineGaps = [];
+            for (let i = 1; i < line.length; i++) {
+                lineGaps.push(line[i].x - line[i-1].x);
+            }
+            const sortedGaps = [...lineGaps].sort((a, b) => a - b);
+            const medianGap = sortedGaps[Math.floor(sortedGaps.length / 2)] || medianDist * 2;
+
+            // Build line text with word spaces
+            let lineText = '';
+            for (let i = 0; i < line.length; i++) {
+                if (i > 0) {
+                    const gap = line[i].x - line[i-1].x;
+                    if (gap > medianGap * 1.5) {
+                        lineText += ' ';
+                    }
+                }
+                lineText += line[i].char;
+            }
+
+            result += lineText;
+            if (lineIdx < nonEmptyLines.length - 1) {
+                result += '\n';
+            }
+        }
+
+        const debug = `Clusters: ${characters.length}, Lines: ${nonEmptyLines.length}, medianDist: ${Math.round(medianDist)}px`;
+
+        return { text: result, debug };
+    }
+
+    let imgElement = new Image();
+    let inputElement = document.getElementById('fileInput');
+    let kernelRange = document.getElementById('kernelSize');
+    let circRange = document.getElementById('circularity');
+    let threshRange = document.getElementById('threshold');
+    let invertCheck = document.getElementById('invertCheck');
+    let clusterX = document.getElementById('clusterX');
+    let clusterY = document.getElementById('clusterY');
+    let canvasOutput = document.getElementById('canvasOutput');
+    let isCvLoaded = false;
+
+    // Manual dot editing
+    let manuallyAddedDots = [];
+    let manuallyRemovedDots = [];
+    let lastAutoDetectedDots = [];
+
+    inputElement.addEventListener('change', (e) => {
+        manuallyAddedDots = [];
+        manuallyRemovedDots = [];
+        imgElement.src = URL.createObjectURL(e.target.files[0]);
+    });
+
+    document.getElementById('resetDots').addEventListener('click', () => {
+        manuallyAddedDots = [];
+        manuallyRemovedDots = [];
+        if (imgElement.src) processImage();
+    });
+
+    // Canvas click handler for adding/removing dots
+    canvasOutput.addEventListener('click', (e) => {
+        if (!imgElement.src || !isCvLoaded) return;
+
+        const rect = canvasOutput.getBoundingClientRect();
+        const scaleX = canvasOutput.width / rect.width;
+        const scaleY = canvasOutput.height / rect.height;
+        const clickX = (e.clientX - rect.left) * scaleX;
+        const clickY = (e.clientY - rect.top) * scaleY;
+
+        const clickRadius = 15;
+
+        // Build current dot list
+        const currentDots = [
+            ...lastAutoDetectedDots.filter(dot =>
+                !manuallyRemovedDots.some(rd => Math.hypot(rd.x - dot.x, rd.y - dot.y) < 5)
+            ),
+            ...manuallyAddedDots
+        ];
+
+        // Find nearest dot to click
+        let nearestIdx = -1;
+        let nearestDist = Infinity;
+        for (let i = 0; i < currentDots.length; i++) {
+            const dist = Math.hypot(currentDots[i].x - clickX, currentDots[i].y - clickY);
+            if (dist < nearestDist) {
+                nearestDist = dist;
+                nearestIdx = i;
+            }
+        }
+
+        if (nearestDist < clickRadius) {
+            const dotToRemove = currentDots[nearestIdx];
+
+            const manualIdx = manuallyAddedDots.findIndex(d =>
+                Math.hypot(d.x - dotToRemove.x, d.y - dotToRemove.y) < 5
+            );
+
+            if (manualIdx >= 0) {
+                manuallyAddedDots.splice(manualIdx, 1);
+            } else {
+                manuallyRemovedDots.push({x: dotToRemove.x, y: dotToRemove.y});
+            }
+        } else {
+            manuallyAddedDots.push({x: clickX, y: clickY});
+        }
+
+        processImage();
+    });
+
+    function onOpenCvReady() {
+        document.getElementById('status').innerText = 'Upload image (pre-cropped, high-ish resolution).';
+        inputElement.disabled = false;
+        isCvLoaded = true;
+    }
+
+    imgElement.onload = () => processImage();
+
+    [kernelRange, circRange, threshRange, invertCheck, clusterX, clusterY].forEach(el => {
+        el.addEventListener('input', () => {
+            document.getElementById('val_kernel').innerText = kernelRange.value + "px";
+            document.getElementById('val_clusterX').innerText = clusterX.value + "x";
+            document.getElementById('val_clusterY').innerText = clusterY.value + "x";
+            if(imgElement.src) processImage();
+        });
+    });
+
+    function processImage() {
+        if (!isCvLoaded) return;
+
+        let src = cv.imread(imgElement);
+        let gray = new cv.Mat();
+        let morph = new cv.Mat();
+        let binary = new cv.Mat();
+        let dst = src.clone(); // Output image
+        
+        // Convert to Grayscale
+        cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+
+        // Invert
+        if (invertCheck.checked) {
+            cv.bitwise_not(gray, gray);
+        }
+
+        // Subtract the background using morphological top-hat transform, leave only dots.
+        let kSize = parseInt(kernelRange.value);
+        let kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(kSize, kSize));
+        cv.morphologyEx(gray, morph, cv.MORPH_TOPHAT, kernel);
+
+        // Basic threshold
+        let threshVal = parseInt(threshRange.value);
+        cv.threshold(morph, binary, threshVal, 255, cv.THRESH_BINARY);
+
+        // Contour detection
+        let contours = new cv.MatVector();
+        let hierarchy = new cv.Mat();
+        cv.findContours(binary, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+        // Poor man's auto-tuning
+        let areas = [];
+        for (let i = 0; i < contours.size(); ++i) {
+            areas.push(cv.contourArea(contours.get(i)));
+        }
+        areas.sort((a, b) => a - b);
+        let medianArea = areas[Math.floor(areas.length / 2)] || 0;
+        
+        // Define dynamic acceptance range based on the median found
+        let minArea = medianArea * 0.4;
+        let maxArea = medianArea * 2.5;
+        let minCirc = parseFloat(circRange.value);
+
+        let validDots = [];
+
+        for (let i = 0; i < contours.size(); ++i) {
+            let cnt = contours.get(i);
+            let area = cv.contourArea(cnt);
+            
+            if (area < minArea || area > maxArea) continue;
+
+            let perimeter = cv.arcLength(cnt, true);
+            if (perimeter === 0) continue;
+            let circularity = (4 * Math.PI * area) / (perimeter * perimeter);
+
+            if (circularity > minCirc) {
+                let rect = cv.boundingRect(cnt);
+                // Calculate centroid
+                let M = cv.moments(cnt, false);
+                let cx = M.m10 / M.m00;
+                let cy = M.m01 / M.m00;
+
+                validDots.push({x: cx, y: cy, auto: true});
+
+                // Draw detected dot
+                let pt1 = new cv.Point(rect.x, rect.y);
+                let pt2 = new cv.Point(rect.x + rect.width, rect.y + rect.height);
+                cv.rectangle(dst, pt1, pt2, new cv.Scalar(0, 255, 0, 255), 2);
+            }
+        }
+
+        // Store auto-detected dots for click detection
+        lastAutoDetectedDots = validDots.map(d => ({x: d.x, y: d.y}));
+
+        // Filter out manually removed dots
+        validDots = validDots.filter(dot =>
+            !manuallyRemovedDots.some(rd => Math.hypot(rd.x - dot.x, rd.y - dot.y) < 10)
+        );
+
+        // Mark removed dots with X on the image
+        for (const rd of manuallyRemovedDots) {
+            cv.line(dst, new cv.Point(rd.x - 8, rd.y - 8), new cv.Point(rd.x + 8, rd.y + 8),
+                new cv.Scalar(255, 0, 0, 255), 2);
+            cv.line(dst, new cv.Point(rd.x + 8, rd.y - 8), new cv.Point(rd.x - 8, rd.y + 8),
+                new cv.Scalar(255, 0, 0, 255), 2);
+        }
+
+        // Add manually added dots
+        for (const md of manuallyAddedDots) {
+            validDots.push({x: md.x, y: md.y, manual: true});
+            // Draw manually added dots with cyan circle
+            cv.circle(dst, new cv.Point(md.x, md.y), 8, new cv.Scalar(0, 255, 255, 255), 2);
+        }
+
+        // Render visualization
+        if (validDots.length > 2) {
+            // Find average nearest neighbor distance
+            let dists = [];
+            for (let i = 0; i < Math.min(validDots.length, 50); i++) {
+                let closest = 99999;
+                for (let j = 0; j < validDots.length; j++) {
+                    if (i === j) continue;
+                    let dx = validDots[i].x - validDots[j].x;
+                    let dy = validDots[i].y - validDots[j].y;
+                    let d = Math.sqrt(dx*dx + dy*dy);
+                    if (d < closest) closest = d;
+                }
+                dists.push(closest);
+            }
+            dists.sort((a, b) => a - b);
+            let medianDist = dists[Math.floor(dists.length / 2)];
+
+            // Draw connections only for valid grid neighbors
+            for (let i = 0; i < validDots.length; i++) {
+                for (let j = i + 1; j < validDots.length; j++) {
+                    let dx = validDots[i].x - validDots[j].x;
+                    let dy = validDots[i].y - validDots[j].y;
+                    let d = Math.sqrt(dx*dx + dy*dy);
+
+                    // Check X and Y distances separately
+                    let maxX = medianDist * parseFloat(clusterX.value);
+                    let maxY = medianDist * parseFloat(clusterY.value);
+                    if (Math.abs(dx) < maxX && Math.abs(dy) < maxY) {
+                        cv.line(dst,
+                            new cv.Point(validDots[i].x, validDots[i].y),
+                            new cv.Point(validDots[j].x, validDots[j].y),
+                            new cv.Scalar(255, 0, 0, 255), 1);
+                    }
+                }
+            }
+
+            // Questionable attempt at reconstructing the actual text
+            let maxXDecode = medianDist * parseFloat(clusterX.value);
+            let maxYDecode = medianDist * parseFloat(clusterY.value);
+            let result = decodeBraille(validDots, medianDist, maxXDecode, maxYDecode, dst);
+            document.getElementById('decodedText').innerText = result.text || '(no characters detected)';
+            document.getElementById('debugInfo').innerText = result.debug;
+        } else {
+            document.getElementById('decodedText').innerText = '(no dots detected)';
+            document.getElementById('debugInfo').innerText = '';
+        }
+
+        cv.imshow('canvasOutput', dst);
+
+        // It's JS, might as well leak the memory?
+        src.delete(); gray.delete(); morph.delete(); binary.delete();
+        dst.delete(); contours.delete(); hierarchy.delete(); kernel.delete();
+    }
+</script>
+</body>
+</html>
